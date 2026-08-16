@@ -50,9 +50,6 @@ data/*
 # Training outputs and model checkpoints
 checkpoints/
 runs/
-outputs/
 wandb/
-*.ckpt
-*.pth
-*.pt
+
 
