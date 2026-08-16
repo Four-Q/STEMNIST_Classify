@@ -1,0 +1,58 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Numba cache
+*.nbc
+*.nbi
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter temporary files
+.ipynb_checkpoints/
+.jupyter/
+
+# Local environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Editors and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Generated datasets and interrupted encoding state
+# Keep only the portable encoded-data archive for GitHub transfer.
+data/*
+!data/spike.zip
+
+# Training outputs and model checkpoints
+checkpoints/
+runs/
+outputs/
+wandb/
+*.ckpt
+*.pth
+*.pt
+

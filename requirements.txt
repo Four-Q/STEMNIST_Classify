@@ -1,0 +1,7 @@
+h5py
+ipykernel
+jupyterlab
+matplotlib
+numba
+numpy
+tqdm
