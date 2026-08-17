@@ -48,10 +48,5 @@ data/*
 !data/spike.zip
 !data/STEMNIST Dataset.zip
 
-# Training outputs and model checkpoints
-checkpoints/
-outputs/
-runs/
-wandb/
 
 
