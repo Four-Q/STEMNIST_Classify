@@ -1,3 +1,6 @@
+from contextlib import nullcontext
+import time
+
 import torch
 from tqdm.auto import tqdm
 from spikingjelly.activation_based import functional
@@ -6,11 +9,57 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
 
 
-def train_epoch(model, train_loader, criterion, optimizer, DEVICE, epoch=None):
+def _autocast_context(device, amp_enabled, amp_dtype):
+    """只在 CUDA 上启用自动混合精度。"""
+
+    device_type = torch.device(device).type
+
+    if amp_enabled and device_type == "cuda":
+        return torch.amp.autocast(
+            device_type="cuda",
+            dtype=amp_dtype,
+        )
+
+    return nullcontext()
+
+
+def _synchronize_cuda(device):
+    """仅在计时边界同步 CUDA，避免每个 batch 强制同步。"""
+
+    if torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def train_epoch(
+    model,
+    train_loader,
+    criterion,
+    optimizer,
+    DEVICE,
+    epoch=None,
+    scaler=None,
+    amp_enabled=False,
+    amp_dtype=torch.float16,
+    progress_update_interval=20,
+):
     model.train()
 
-    total_loss = 0.0
-    total_correct = 0
+    if progress_update_interval <= 0:
+        raise ValueError("progress_update_interval 必须大于 0")
+
+    device = torch.device(DEVICE)
+    amp_enabled = bool(
+        amp_enabled
+        and device.type == "cuda"
+    )
+
+    # 将累计指标保留在设备端，只在更新进度条时同步到 CPU。
+    total_loss = torch.zeros((), device=device)
+    total_correct = torch.zeros(
+        (),
+        device=device,
+        dtype=torch.long,
+    )
     total_samples = 0
 
     # 清理 Notebook 之前可能遗留的 LIF 状态
@@ -29,7 +78,16 @@ def train_epoch(model, train_loader, criterion, optimizer, DEVICE, epoch=None):
         leave=True,
     )
 
-    for inputs, labels in progress_bar:
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    _synchronize_cuda(device)
+    start_time = time.perf_counter()
+
+    for batch_index, (inputs, labels) in enumerate(
+        progress_bar,
+        start=1,
+    ):
         # DataLoader:
         # inputs [N,T,C,H,W]
         # labels  [N]
@@ -54,53 +112,96 @@ def train_epoch(model, train_loader, criterion, optimizer, DEVICE, epoch=None):
         # 清除参数梯度
         optimizer.zero_grad(set_to_none=True)
 
-        # logits: [N,num_classes]
-        logits = model(inputs)
-        loss = criterion(
-            logits.float(),
-            labels,
+        # 卷积和线性层在 AMP 下使用 Tensor Core；交叉熵仍会自动
+        # 使用数值更稳定的 float32 路径。
+        with _autocast_context(
+            device,
+            amp_enabled,
+            amp_dtype,
+        ):
+            logits = model(inputs)
+            loss = criterion(
+                logits.float(),
+                labels,
+            )
+
+        use_scaler = (
+            scaler is not None
+            and scaler.is_enabled()
         )
-        # 反向传播
-        loss.backward()
-        # 梯度裁剪
-        grad_norm = torch.nn.utils.clip_grad_norm_(
+
+        if use_scaler:
+            # float16 训练先缩放梯度，再在裁剪前还原梯度尺度。
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+        else:
+            # bfloat16 和 float32 不需要梯度缩放。
+            loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 max_norm=1.0,
                 error_if_nonfinite=True,
             )
-        # 更新参数
-        optimizer.step()
+
+        if use_scaler:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         # 保存当前批次的统计值
-        batch_loss = loss.detach().item()
         predictions = (
             logits.detach()
             .argmax(dim=1)
         )
         batch_correct = (
             predictions == labels
-        ).sum().item()
+        ).sum()
 
-        total_loss += batch_loss * batch_size
+        total_loss += loss.detach().float() * batch_size
         total_correct += batch_correct
         total_samples += batch_size
 
-        average_loss = total_loss / total_samples
-        average_accuracy = total_correct / total_samples
-
-        # 更新进度条右侧信息
-        progress_bar.set_postfix(
-            loss=f"{average_loss:.4f}",
-            accuracy=f"{average_accuracy:.4f}",
+        # .item() 会同步 GPU。降低更新频率可减少 CPU 等待 GPU。
+        should_update_progress = (
+            batch_index % progress_update_interval == 0
+            or batch_index == len(train_loader)
         )
+
+        if should_update_progress:
+            average_loss = (
+                total_loss.item() / total_samples
+            )
+            average_accuracy = (
+                total_correct.item() / total_samples
+            )
+
+            progress_bar.set_postfix(
+                loss=f"{average_loss:.4f}",
+                accuracy=f"{average_accuracy:.4f}",
+            )
 
     if total_samples == 0:
         raise RuntimeError("train_loader 中没有样本。")
 
+    _synchronize_cuda(device)
+    elapsed_seconds = time.perf_counter() - start_time
+
+    peak_memory_gb = 0.0
+    if device.type == "cuda":
+        peak_memory_gb = (
+            torch.cuda.max_memory_allocated(device)
+            / 1024**3
+        )
+
     return {
-        "loss": total_loss / total_samples,
-        "accuracy": total_correct / total_samples,
+        "loss": total_loss.item() / total_samples,
+        "accuracy": total_correct.item() / total_samples,
         "samples": total_samples,
+        "elapsed_seconds": elapsed_seconds,
+        "samples_per_second": total_samples / elapsed_seconds,
+        "peak_memory_gb": peak_memory_gb,
     }
 
 
@@ -110,24 +211,32 @@ def validate_epoch(
     criterion,
     device,
     epoch=None,
+    amp_enabled=False,
+    amp_dtype=torch.float16,
+    progress_update_interval=20,
 ):
+
+    if progress_update_interval <= 0:
+        raise ValueError("progress_update_interval 必须大于 0")
+
+    device = torch.device(device)
+    amp_enabled = bool(
+        amp_enabled
+        and device.type == "cuda"
+    )
 
     # 保存模型原来的训练/验证状态
     was_training = model.training
     model.eval()
 
-    total_loss = 0.0
-    total_correct = 0
+    total_loss = torch.zeros((), device=device)
+    total_correct = torch.zeros(
+        (),
+        device=device,
+        dtype=torch.long,
+    )
     total_samples = 0
-
-    all_targets = []
-    all_predictions = []
-
-    firing_rate_sums = {
-        "lif1": 0.0,
-        "lif2": 0.0,
-        "output_lif": 0.0,
-    }
+    firing_rate_sums = {}
 
     description = (
         f"Val Epoch {epoch}"
@@ -143,86 +252,111 @@ def validate_epoch(
         dynamic_ncols=True,
         leave=True,
     )
-    # 验证阶段不需要构建计算图
-    with torch.no_grad():
-        for inputs, labels in progress_bar:
+    _synchronize_cuda(device)
+    start_time = time.perf_counter()
 
-            inputs = inputs.to(
-                device,
-                dtype=torch.float32,
-                non_blocking=True,
-            )
+    try:
+        # 验证阶段不需要构建计算图。
+        with torch.no_grad():
+            for batch_index, (inputs, labels) in enumerate(
+                progress_bar,
+                start=1,
+            ):
 
-            labels = labels.to(
-                device,
-                dtype=torch.long,
-                non_blocking=True,
-            )
-            # [N,T,C,H,W] -> [T,N,C,H,W]
-            inputs = inputs.permute(
-                1, 0, 2, 3, 4
-            ).contiguous()
-
-            batch_size = labels.size(0)
-
-            functional.reset_net(model)
-            # logits: [N,35]
-            logits, firing_rates = model(
-                inputs,
-                return_firing_rates=True,
-            )
-            loss = criterion(
-                logits.float(),
-                labels,
-            )
-
-            predictions = logits.argmax(dim=1)
-            batch_correct = (
-                predictions == labels
-            ).sum().item()
-
-            total_loss += loss.item() * batch_size
-            total_correct += batch_correct
-            total_samples += batch_size
-
-            all_targets.extend(
-                labels.cpu().tolist()
-            )
-            all_predictions.extend(
-                predictions.cpu().tolist()
-            )
-
-            for name, rate in firing_rates.items():
-                firing_rate_sums[name] += (
-                    rate.item() * batch_size
+                inputs = inputs.to(
+                    device,
+                    dtype=torch.float32,
+                    non_blocking=True,
                 )
 
-            average_loss = total_loss / total_samples
-            average_accuracy = (
-                total_correct / total_samples
-            )
+                labels = labels.to(
+                    device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                )
+                # [N,T,C,H,W] -> [T,N,C,H,W]
+                inputs = inputs.permute(
+                    1, 0, 2, 3, 4
+                ).contiguous()
 
-            progress_bar.set_postfix(
-                loss=f"{average_loss:.4f}",
-                accuracy=f"{average_accuracy:.4f}",
-            )
+                batch_size = labels.size(0)
 
-    functional.reset_net(model)
+                functional.reset_net(model)
 
-    # 恢复调用验证函数之前的状态
-    model.train(was_training)
+                with _autocast_context(
+                    device,
+                    amp_enabled,
+                    amp_dtype,
+                ):
+                    logits, firing_rates = model(
+                        inputs,
+                        return_firing_rates=True,
+                    )
+                    loss = criterion(
+                        logits.float(),
+                        labels,
+                    )
+
+                predictions = logits.argmax(dim=1)
+                batch_correct = (
+                    predictions == labels
+                ).sum()
+
+                total_loss += (
+                    loss.detach().float() * batch_size
+                )
+                total_correct += batch_correct
+                total_samples += batch_size
+
+                for name, rate in firing_rates.items():
+                    if name not in firing_rate_sums:
+                        firing_rate_sums[name] = torch.zeros(
+                            (),
+                            device=device,
+                        )
+
+                    firing_rate_sums[name] += (
+                        rate.detach().float() * batch_size
+                    )
+
+                should_update_progress = (
+                    batch_index % progress_update_interval == 0
+                    or batch_index == len(val_loader)
+                )
+
+                if should_update_progress:
+                    average_loss = (
+                        total_loss.item() / total_samples
+                    )
+                    average_accuracy = (
+                        total_correct.item() / total_samples
+                    )
+
+                    progress_bar.set_postfix(
+                        loss=f"{average_loss:.4f}",
+                        accuracy=f"{average_accuracy:.4f}",
+                    )
+    finally:
+        functional.reset_net(model)
+        # 即使验证发生异常，也恢复调用前的训练/验证状态。
+        model.train(was_training)
 
     if total_samples == 0:
         raise RuntimeError("val_loader 中没有样本。")
 
+    _synchronize_cuda(device)
+    elapsed_seconds = time.perf_counter() - start_time
+
     return {
-        "loss": total_loss / total_samples,
-        "accuracy": total_correct / total_samples,
+        "loss": total_loss.item() / total_samples,
+        "accuracy": total_correct.item() / total_samples,
         "samples": total_samples,
         "firing_rates": {
-            name: value / total_samples
+            name: value.item() / total_samples
             for name, value in firing_rate_sums.items()
         },
+        "elapsed_seconds": elapsed_seconds,
+        "samples_per_second": total_samples / elapsed_seconds,
     }
 
 def train_model(
@@ -234,8 +368,27 @@ def train_model(
     device,
     num_epochs,
     save_path="best_model.pt",
-    scheduler=None
+    scheduler=None,
+    amp_enabled=False,
+    amp_dtype=torch.float16,
+    progress_update_interval=20,
+    checkpoint_metadata=None,
 ):
+    device = torch.device(device)
+    amp_enabled = bool(
+        amp_enabled
+        and device.type == "cuda"
+    )
+
+    # float16 需要 GradScaler；bfloat16 具有更大的指数范围，通常不需要。
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=(
+            amp_enabled
+            and amp_dtype == torch.float16
+        ),
+    )
+
     save_path = Path(save_path)
     save_path.parent.mkdir(
         parents=True,
@@ -247,7 +400,10 @@ def train_model(
         "train_accuracy": [],
         "val_loss": [],
         "val_accuracy": [],
-        "learning_rate": []
+        "learning_rate": [],
+        "train_samples_per_second": [],
+        "val_samples_per_second": [],
+        "peak_memory_gb": [],
     }
 
     best_val_accuracy = -1.0
@@ -268,6 +424,10 @@ def train_model(
             optimizer=optimizer,
             DEVICE=device,
             epoch=epoch,
+            scaler=scaler,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            progress_update_interval=progress_update_interval,
         )
 
         functional.reset_net(model)
@@ -279,6 +439,9 @@ def train_model(
             criterion=criterion,
             device=device,
             epoch=epoch,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            progress_update_interval=progress_update_interval,
         )
         # 发放率监控
         rates = val_metrics["firing_rates"]
@@ -312,6 +475,15 @@ def train_model(
             val_metrics["accuracy"]
         )
         history["learning_rate"].append(current_lr)
+        history["train_samples_per_second"].append(
+            train_metrics["samples_per_second"]
+        )
+        history["val_samples_per_second"].append(
+            val_metrics["samples_per_second"]
+        )
+        history["peak_memory_gb"].append(
+            train_metrics["peak_memory_gb"]
+        )
 
         train_loss = train_metrics["loss"]
         train_accuracy = train_metrics["accuracy"]
@@ -324,7 +496,9 @@ def train_model(
             f"Train accuracy: {train_accuracy:.4f} | "
             f"Val loss: {val_loss:.4f} | "
             f"Val accuracy: {val_accuracy:.4f} | "
-            f"LR: {current_lr:.6g}"
+            f"LR: {current_lr:.6g} | "
+            f"Train: {train_metrics['samples_per_second']:.1f} samples/s | "
+            f"GPU peak: {train_metrics['peak_memory_gb']:.2f} GiB"
         )
 
         # 学习率衰退
@@ -348,6 +522,19 @@ def train_model(
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": (
+                    scheduler.state_dict()
+                    if scheduler is not None
+                    else None
+                ),
+                "scaler_state_dict": (
+                    scaler.state_dict()
+                    if scaler.is_enabled()
+                    else None
+                ),
+                "amp_enabled": amp_enabled,
+                "amp_dtype": str(amp_dtype),
+                "metadata": dict(checkpoint_metadata or {}),
                 "train_loss": train_loss,
                 "train_accuracy": train_accuracy,
                 "val_loss": val_loss,

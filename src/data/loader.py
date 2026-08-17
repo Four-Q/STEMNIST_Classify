@@ -19,6 +19,9 @@ class LoaderConfig:
         pin_memory=False,
         seed=42,
         drop_last=False,
+        persistent_workers=None,
+        prefetch_factor=2,
+        in_memory=False,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size 必须大于 0")
@@ -26,11 +29,25 @@ class LoaderConfig:
         if num_workers < 0:
             raise ValueError("num_workers 不能小于 0")
 
+        if prefetch_factor <= 0:
+            raise ValueError("prefetch_factor 必须大于 0")
+
+        if persistent_workers is None:
+            persistent_workers = num_workers > 0
+
+        if persistent_workers and num_workers == 0:
+            raise ValueError(
+                "persistent_workers=True 时 num_workers 必须大于 0"
+            )
+
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.seed = seed
         self.drop_last = drop_last
+        self.persistent_workers = bool(persistent_workers)
+        self.prefetch_factor = prefetch_factor
+        self.in_memory = bool(in_memory)
 
 
 def _seed_worker(worker_id):
@@ -68,6 +85,7 @@ def create_loader(
         split=split,
         data_kind=data_kind,
         transform=transform,
+        in_memory=config.in_memory,
     )
 
     # 默认只有训练集打乱顺序。
@@ -84,19 +102,24 @@ def create_loader(
         and split == "train"
     )
 
-    # num_workers 为 0 时不能启用 persistent_workers。
-    persistent_workers = config.num_workers > 0
+    loader_arguments = {
+        "dataset": dataset,
+        "batch_size": config.batch_size,
+        "shuffle": shuffle,
+        "num_workers": config.num_workers,
+        "pin_memory": config.pin_memory,
+        "drop_last": drop_last,
+        "persistent_workers": config.persistent_workers,
+        "worker_init_fn": _seed_worker,
+        "generator": generator,
+    }
+
+    # PyTorch 仅允许在启用 worker 时设置 prefetch_factor。
+    if config.num_workers > 0:
+        loader_arguments["prefetch_factor"] = config.prefetch_factor
 
     return DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        shuffle=shuffle,
-        num_workers=config.num_workers,
-        pin_memory=config.pin_memory,
-        drop_last=drop_last,
-        persistent_workers=persistent_workers,
-        worker_init_fn=_seed_worker,
-        generator=generator,
+        **loader_arguments,
     )
 
 

@@ -32,6 +32,7 @@ class STEMNISTDataset(Dataset):
         split,
         data_kind,
         transform=None,
+        in_memory=False,
     ):
         # 只接受仓库已经生成的三个数据划分。
         valid_splits = ("train", "val", "test")
@@ -59,6 +60,7 @@ class STEMNISTDataset(Dataset):
         self.data_root = Path(data_root)
         self.split = split
         self.data_kind = data_kind
+        self.in_memory = bool(in_memory)
 
         # 例如：
         # data/pressure/train/pressure.npy
@@ -86,12 +88,21 @@ class STEMNISTDataset(Dataset):
         # manifest 保存样本标签、sample_id 和数组行号。
         self.rows = self._read_manifest()
 
-        # mmap_mode="r" 不会一次性把整个数组加载进内存。
-        # 训练集文件约 331 MB，使用内存映射更加合适。
-        array = np.load(
-            self.data_path,
-            mmap_mode="r",
-        )
+        if self.in_memory:
+            # Linux 训练服务器内存充足时，可将整个划分读入内存。
+            # DataLoader 使用 fork worker 时，这些只读数据页可由 worker
+            # 共享，能够避免首轮训练中的随机磁盘读取。
+            array = np.load(
+                self.data_path,
+                allow_pickle=False,
+            )
+        else:
+            # 默认仍使用内存映射，避免普通开发环境占用过多内存。
+            array = np.load(
+                self.data_path,
+                mmap_mode="r",
+                allow_pickle=False,
+            )
 
         # 完整数组必须是 [N, T, H, W]。
         if array.ndim != 4:
@@ -121,13 +132,14 @@ class STEMNISTDataset(Dataset):
                 f"{array.shape[0]} != {len(self.rows)}"
             )
 
-        # 初始化阶段只使用 array 检查元数据。
-        # 删除引用后，真正的数据会在首次访问样本时重新打开。
-        del array
-
-        # 延迟打开 memmap。
-        # 多进程 DataLoader 中，每个 worker 会拥有自己的映射。
-        self._data = None
+        if self.in_memory:
+            # 保留已加载数组，后续读取不会再访问磁盘。
+            self._data = array
+        else:
+            # mmap 模式只在初始化阶段检查元数据，worker 首次读取时
+            # 再各自打开文件映射。
+            del array
+            self._data = None
 
         if data_kind == "pressure":
             # 即使调用者没有传入 transform，也需要进行基础的
@@ -237,12 +249,13 @@ class STEMNISTDataset(Dataset):
         ]
 
     def _open_array(self):
-        """首次读取样本时打开内存映射数组。"""
+        """返回内存数组，或在首次读取时打开文件映射。"""
 
         if self._data is None:
             self._data = np.load(
                 self.data_path,
                 mmap_mode="r",
+                allow_pickle=False,
             )
 
         return self._data
@@ -250,10 +263,11 @@ class STEMNISTDataset(Dataset):
     def __getstate__(self):
         """确保 Windows worker 不直接继承已打开的 memmap。"""
 
-        # DataLoader 在 Windows 上使用 spawn 创建 worker。
-        # 复制 Dataset 状态时清空 memmap，让 worker 自行打开。
+        # mmap 句柄不应被 spawn worker 直接继承；内存常驻模式则保留
+        # 数组。Linux 默认使用 fork，内存页不会因为只读访问而复制。
         state = self.__dict__.copy()
-        state["_data"] = None
+        if not self.in_memory:
+            state["_data"] = None
 
         return state
 

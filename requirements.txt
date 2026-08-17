@@ -5,6 +5,9 @@ matplotlib
 numba
 numpy
 tqdm
-torch
-spikingjelly
+torch>=2.8
+spikingjelly==0.0.0.0.14
 pandas
+
+# CUDA 12.x 下为 SpikingJelly 多步 LIF 提供 CuPy 加速后端。
+cupy-cuda12x
