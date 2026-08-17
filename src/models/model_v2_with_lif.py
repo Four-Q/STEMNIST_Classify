@@ -125,7 +125,7 @@ class ConvSNNv2(nn.Module):
         functional.set_backend(
             self,
             backend=backend,
-            instance=neuron.ParametricLIFNode,
+            instance=neuron.LIFNode,
         )
 
     def _make_lif(self) -> neuron.LIFNode:
