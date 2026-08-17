@@ -20,13 +20,12 @@ python -m pip install -r requirements.txt
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name())"
 ```
 
-运行`src/train/pressure_snn_train.ipynb`训练压力数据，运行`src/train/spike_snn_train.ipynb`训练脉冲数据。Notebook默认启用以下加速项：
+运行`src/train/pressure_snn_train.ipynb`训练压力数据，运行`src/train/spike_snn_train.ipynb`训练脉冲数据。Notebook默认设置`REPRODUCIBLE = True`，用于在相同硬件与软件环境中重复训练结果：
 
-- float16自动混合精度与梯度缩放；
-- TensorFloat-32与cuDNN卷积自动调优；
-- SpikingJelly CuPy多步LIF后端；
-- 8个持久DataLoader worker、预取和数据内存常驻；
-- 降低进度指标同步频率，并记录samples/s和峰值显存。
+- 固定Python、NumPy、PyTorch、CUDA和DataLoader worker的随机种子；
+- 启用PyTorch确定性算法并配置cuBLAS确定性工作区；
+- 关闭TF32与cuDNN自动选优，使用Torch多步LIF后端；
+- 保留float16自动混合精度、数据预取和内存常驻。
 
-实验结果分别写入`outputs/pressure/`和`outputs/spike/`。若CuPy或混合精度出现兼容性问题，可在Notebook参数区将`SNN_BACKEND`设为`"torch"`或将`AMP_ENABLED`设为`False`。
+每次完整复现实验前必须重启内核并从头运行全部单元。实验目录名包含随机种子与确定性标记，结果分别写入`outputs/pressure/`和`outputs/spike/`。如需优先追求吞吐量，可设置`REPRODUCIBLE = False`，此时会启用TF32、cuDNN自动选优和CuPy后端，但不再承诺逐次结果一致。
 
