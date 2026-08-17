@@ -138,11 +138,13 @@ def train_epoch(
             # bfloat16 和 float32 不需要梯度缩放。
             loss.backward()
 
+        # AMP 出现瞬时溢出时，GradScaler 会跳过本批次并自动降低
+        # 缩放值。非 AMP 训练没有这层保护，因此继续严格检查梯度。
         torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=1.0,
-                error_if_nonfinite=True,
-            )
+            model.parameters(),
+            max_norm=1.0,
+            error_if_nonfinite=not use_scaler,
+        )
 
         if use_scaler:
             scaler.step(optimizer)
@@ -371,6 +373,7 @@ def train_model(
     scheduler=None,
     amp_enabled=False,
     amp_dtype=torch.float16,
+    amp_init_scale=1024.0,
     progress_update_interval=20,
     checkpoint_metadata=None,
 ):
@@ -380,9 +383,15 @@ def train_model(
         and device.type == "cuda"
     )
 
-    # float16 需要 GradScaler；bfloat16 具有更大的指数范围，通常不需要。
+    if amp_init_scale <= 0:
+        raise ValueError("amp_init_scale 必须大于 0")
+
+    # 240 个时间步的 SNN 反向传播比普通 CNN 更容易在较大的初始
+    # 缩放值下溢出，因此使用更保守的起始值，之后仍由 GradScaler
+    # 根据实际梯度动态调整。
     scaler = torch.amp.GradScaler(
         "cuda",
+        init_scale=amp_init_scale,
         enabled=(
             amp_enabled
             and amp_dtype == torch.float16
